@@ -1,0 +1,13 @@
+{
+    "origins": {
+        "Fresno, CA": {"lat": 36.7378, "lon": -119.7871, "multiplier": 1.10},
+        "Portland, OR": {"lat": 45.5152, "lon": -122.6784, "multiplier": 1.05},
+        "Denver, CO": {"lat": 39.7392, "lon": -104.9903, "multiplier": 0.95},
+        "Chicago, IL": {"lat": 41.8781, "lon": -87.6298, "multiplier": 1.00}
+    },
+    "equipment": {
+        "53' Dry Van": {"weight": 45000.0, "cube": 2800.0, "pallets": 26},
+        "53' Refrigerated (Reefer)": {"weight": 43500.0, "cube": 2600.0, "pallets": 26},
+        "48' Flatbed": {"weight": 48000.0, "cube": 1600.0, "pallets": 24}
+    }
+}

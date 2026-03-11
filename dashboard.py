@@ -9,7 +9,14 @@ from statsmodels.tsa.arima.model import ARIMA
 
 warnings.filterwarnings("ignore")
 
-# api and routing utilities
+# --- 1. DATA & CONFIGURATION ---
+
+@st.cache_data
+def load_database():
+    with open('database.json', 'r') as f:
+        return json.load(f)
+
+# --- 2. API & ROUTING UTILITIES ---
 
 def get_osrm_route(origin_lat, origin_lon, dest_lat, dest_lon):
     url = f"http://router.project-osrm.org/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}?overview=false"
@@ -24,32 +31,31 @@ def get_osrm_route(origin_lat, origin_lon, dest_lat, dest_lon):
         pass
     return None, None
 
-def get_live_dat_rate(total_billable_miles, origin_name):
+def get_live_dat_rate(total_billable_miles, origin_name, db):
     base_rate_per_mile = 2.25
     fuel_surcharge = 0.45 
-    multiplier = {"Fresno, CA": 1.10, "Portland, OR": 1.05, "Denver, CO": 0.95, "Chicago, IL": 1.00}.get(origin_name, 1.0)
+    multiplier = db["origins"].get(origin_name, {}).get("multiplier", 1.0)
     return max(total_billable_miles * (base_rate_per_mile + fuel_surcharge) * multiplier, 1200.0)
 
-def get_transit_metrics(origin_name, num_stops):
-    origins = {
-        "Fresno, CA": (36.7378, -119.7871), "Portland, OR": (45.5152, -122.6784), 
-        "Denver, CO": (39.7392, -104.9903), "Chicago, IL": (41.8781, -87.6298)
-    }
+def get_transit_metrics(origin_name, num_stops, db):
+    origin_data = db["origins"][origin_name]
     hub = (38.5816, -121.4944) 
-    highway_miles, driving_days = get_osrm_route(origins[origin_name][0], origins[origin_name][1], hub[0], hub[1])
+    highway_miles, driving_days = get_osrm_route(origin_data["lat"], origin_data["lon"], hub[0], hub[1])
     
     if highway_miles is None:
         R = 3958.8 
-        dLat, dLon = math.radians(hub[0] - origins[origin_name][0]), math.radians(hub[1] - origins[origin_name][1])
-        a = math.sin(dLat/2)**2 + math.cos(math.radians(origins[origin_name][0])) * math.cos(math.radians(hub[0])) * math.sin(dLon/2)**2
+        dLat, dLon = math.radians(hub[0] - origin_data["lat"]), math.radians(hub[1] - origin_data["lon"])
+        a = math.sin(dLat/2)**2 + math.cos(math.radians(origin_data["lat"])) * math.cos(math.radians(hub[0])) * math.sin(dLon/2)**2
         highway_miles = int((R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))) * 1.15)
         driving_days = highway_miles / 600.0
 
     total_billable_miles = highway_miles + 50
     effective_transit_days = math.ceil(driving_days + (math.floor(driving_days) * 0.25) + math.floor(num_stops / 3))
     
-    benchmark_rate = get_live_dat_rate(total_billable_miles, origin_name)
+    benchmark_rate = get_live_dat_rate(total_billable_miles, origin_name, db)
     return highway_miles, total_billable_miles, effective_transit_days, benchmark_rate
+
+# --- 3. MATHEMATICAL & PANDAS ENGINES ---
 
 def get_scenario_multipliers(quarter_str, miles):
     base_sigma = 0.25 + (0.10 if miles > 1000 else 0)
@@ -59,12 +65,13 @@ def get_scenario_multipliers(quarter_str, miles):
     else: return 1.8, 2.0, 2.2, "2026-10-01", base_sigma + 0.15
 
 def load_and_prep_data(filepath, m_milk, m_cups, m_beans, start_date):
-    df = pd.read_csv(filepath)
+    df = pd.read_csv(filepath).copy()
     unique_dates = sorted(pd.to_datetime(df['Date']).unique())
-    df['Date'] = pd.to_datetime(df['Date']).map(dict(zip(unique_dates, pd.date_range(start=start_date, periods=len(unique_dates)))))
-    df['Oat_Milk_Used'] = (df['Oat_Milk_Used'] * m_milk).astype(int)
-    df['Paper_Cups_Used'] = (df['Paper_Cups_Used'] * m_cups).astype(int)
-    df['Beans_Used'] = (df['Beans_Used'] * m_beans).astype(int)
+    # Senior Dev Enforced: Strict use of .loc for memory-safe Pandas assignments
+    df.loc[:, 'Date'] = pd.to_datetime(df['Date']).map(dict(zip(unique_dates, pd.date_range(start=start_date, periods=len(unique_dates)))))
+    df.loc[:, 'Oat_Milk_Used'] = (df['Oat_Milk_Used'] * m_milk).astype(int)
+    df.loc[:, 'Paper_Cups_Used'] = (df['Paper_Cups_Used'] * m_cups).astype(int)
+    df.loc[:, 'Beans_Used'] = (df['Beans_Used'] * m_beans).astype(int)
     return df
 
 def get_optimal_cycle(df, max_vol, max_weight, max_pallets):
@@ -120,18 +127,36 @@ def create_tms_payload(origin, miles, lead_time, weight, vol, pallets, df_totals
         "manifest_stops": [{"stop": i+1, "loc": r['Shop_Location'], "pallets": int(r['Total_Pallets'])} for i, r in df_totals.iterrows()]
     }, indent=4)
 
-# application layout and execution
+
+# --- 4. UI RENDERING MODULES ---
+
+def render_kpi_header(cycle, opt_cycle, net_savings, penalty, spoilage, carbon, s_level, lead_time):
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Optimal FTL Cycle", f"{cycle} Days", f"Recommended: {max(1, min(opt_cycle, 90))} Days")
+    
+    savings_str = f"-${abs(net_savings):,.2f}" if net_savings < 0 else f"${net_savings:,.2f}"
+    if (spoilage + penalty) > 5.0:
+        kpi2.metric("True Net Savings", savings_str, f"-${spoilage + penalty:,.0f} Risk & Spoilage", delta_color="normal")
+    else:
+        kpi2.metric("True Net Savings", savings_str, f"+${carbon:,.0f} ESG Tax Credit", delta_color="normal" if net_savings > 0 else "inverse")
+        
+    kpi3.metric("Network Survival Risk", f"{s_level:.1f}%", f"Lead Time: {lead_time} Days", delta_color="normal" if s_level >= 95 else "inverse")
+    kpi4.metric("Carbon Emissions Avoided", f"{carbon / 0.085:,.0f} kg", "EPA Ton-Mile Calc")
+
+# --- 5. MAIN APPLICATION EXECUTION ---
 
 def main():
     st.set_page_config(page_title="Logistics Control Tower", layout="wide", initial_sidebar_state="expanded")
+    db = load_database()
 
     # sidebar config
     st.sidebar.markdown("## 🎛️ Control Tower")
     quarter = st.sidebar.selectbox("Business Quarter:", ["Q1 (Jan-Mar): Baseline", "Q2 (Apr-Jun): Spring Growth", "Q3 (Jul-Sep): Summer Peak", "Q4 (Oct-Dec): Holiday Rush"])
     
     with st.sidebar.expander("🚛 Network & Equipment", expanded=False):
-        origin = st.selectbox("Manufacturer Location:", ["Fresno, CA", "Portland, OR", "Denver, CO", "Chicago, IL"])
-        trailer_type = st.selectbox("Equipment Type:", ["53' Dry Van", "53' Refrigerated (Reefer)", "48' Flatbed"])
+        # Database Integration: Pulling dynamically from JSON
+        origin = st.selectbox("Manufacturer Location:", list(db["origins"].keys()))
+        trailer_type = st.selectbox("Equipment Type:", list(db["equipment"].keys()))
         allow_double_stack = st.checkbox("Enable Double-Stacking", value=False)
         requires_liftgate = st.checkbox("Retail Liftgate Delivery", value=True)
     
@@ -142,20 +167,21 @@ def main():
         max_backroom_pallets = st.slider("Max Retail Backroom (Pallets):", 2, 12, 4)
 
     network_stops_init = 6
-    _, total_billable_miles_init, _, benchmark_rate_init = get_transit_metrics(origin, network_stops_init)
+    _, total_billable_miles_init, _, benchmark_rate_init = get_transit_metrics(origin, network_stops_init, db)
     
     with st.sidebar.expander("📊 Carrier Bidding", expanded=False):
         freight_bill = st.slider("Base FTL Carrier Quote ($)", 100.0, 8000.0, float(benchmark_rate_init), 50.0)
         base_ltl_rate = st.number_input("Base LTL Rate per CuFt ($)", 0.01, value=2.10, step=0.10)
 
-    # physical constraints setup
-    eq_specs = {"53' Dry Van": (45000.0, 2800.0, 26), "53' Refrigerated (Reefer)": (43500.0, 2600.0, 26), "48' Flatbed": (48000.0, 1600.0, 24)}
-    max_weight, max_vol, base_pallets = eq_specs[trailer_type]
+    # Database Integration: Using JSON specs
+    max_weight = db["equipment"][trailer_type]["weight"]
+    max_vol = db["equipment"][trailer_type]["cube"]
+    base_pallets = db["equipment"][trailer_type]["pallets"]
     max_pallets = base_pallets * 2 if allow_double_stack else base_pallets
 
     # core data execution
     network_stops = 6 
-    hw_miles, bill_miles, transit_days, benchmark_rate = get_transit_metrics(origin, 6)
+    hw_miles, bill_miles, transit_days, benchmark_rate = get_transit_metrics(origin, 6, db)
     m_milk, m_cups, m_beans, start_mon, dyn_sigma = get_scenario_multipliers(quarter, bill_miles)
     df = load_and_prep_data('network_inventory_history.csv', m_milk, m_cups, m_beans, start_mon)
     total_lead_time = transit_days + facility_processing_days
@@ -177,22 +203,23 @@ def main():
     
     esc = ((a_milk*25.0) + (a_cups*10.0) + (a_beans*85.0)) * total_lead_time * ((100.0 - service_level) / 100.0)
     
-    # calculate payload requirements based on selected cycle
-    df_cycle = df[df['Date'] > (df['Date'].max() - pd.Timedelta(days=order_cycle_days))]
+    # calculate payload requirements
+    df_cycle = df.loc[df['Date'] > (df['Date'].max() - pd.Timedelta(days=order_cycle_days))].copy()
     df_totals = df_cycle.groupby('Shop_Location')[['Oat_Milk_Used', 'Paper_Cups_Used', 'Beans_Used']].sum().reset_index()
     
-    df_totals['Total_Pallets'] = np.ceil(df_totals['Oat_Milk_Used']/p_map['Oat_Milk_Used']) + np.ceil(df_totals['Paper_Cups_Used']/p_map['Paper_Cups_Used']) + np.ceil(df_totals['Beans_Used']/p_map['Beans_Used'])
-    df_totals['Total_Volume_CuFt'] = (df_totals['Oat_Milk_Used']*v_map['Oat_Milk_Used']) + (df_totals['Paper_Cups_Used']*v_map['Paper_Cups_Used']) + (df_totals['Beans_Used']*v_map['Beans_Used']) + (df_totals['Total_Pallets']*5.5)
-    df_totals['Total_Weight_Lbs'] = (df_totals['Oat_Milk_Used']*w_map['Oat_Milk_Used']) + (df_totals['Paper_Cups_Used']*w_map['Paper_Cups_Used']) + (df_totals['Beans_Used']*w_map['Beans_Used']) + (df_totals['Total_Pallets']*50.0)
+    # Senior Dev Enforced: Strict use of .loc for memory-safe Pandas assignments
+    df_totals.loc[:, 'Total_Pallets'] = np.ceil(df_totals['Oat_Milk_Used']/p_map['Oat_Milk_Used']) + np.ceil(df_totals['Paper_Cups_Used']/p_map['Paper_Cups_Used']) + np.ceil(df_totals['Beans_Used']/p_map['Beans_Used'])
+    df_totals.loc[:, 'Total_Volume_CuFt'] = (df_totals['Oat_Milk_Used']*v_map['Oat_Milk_Used']) + (df_totals['Paper_Cups_Used']*v_map['Paper_Cups_Used']) + (df_totals['Beans_Used']*v_map['Beans_Used']) + (df_totals['Total_Pallets']*5.5)
+    df_totals.loc[:, 'Total_Weight_Lbs'] = (df_totals['Oat_Milk_Used']*w_map['Oat_Milk_Used']) + (df_totals['Paper_Cups_Used']*w_map['Paper_Cups_Used']) + (df_totals['Beans_Used']*w_map['Beans_Used']) + (df_totals['Total_Pallets']*50.0)
     
     tot_vol, tot_weight, tot_pallets = df_totals['Total_Volume_CuFt'].sum(), df_totals['Total_Weight_Lbs'].sum(), df_totals['Total_Pallets'].sum()
     vol_fill_rate, weight_fill_rate, pallet_fill_rate = (tot_vol/max_vol)*100, (tot_weight/max_weight)*100, (tot_pallets/max_pallets)*100
 
     raw_ltl = (df_totals['Oat_Milk_Used']*v_map['Oat_Milk_Used']*base_ltl_rate*0.8) + (df_totals['Paper_Cups_Used']*v_map['Paper_Cups_Used']*base_ltl_rate*1.8) + (df_totals['Beans_Used']*v_map['Beans_Used']*base_ltl_rate*1.0)
-    df_totals['Est_LTL_Cost_$'] = np.maximum((raw_ltl * 1.30) + (150.0 if requires_liftgate else 0) + (np.maximum(0.0, df_totals['Total_Pallets'] - 6.0) * 125.0), 250.0)
+    df_totals.loc[:, 'Est_LTL_Cost_$'] = np.maximum((raw_ltl * 1.30) + (150.0 if requires_liftgate else 0) + (np.maximum(0.0, df_totals['Total_Pallets'] - 6.0) * 125.0), 250.0)
 
     # inventory value and holding cost penalties
-    df_totals['Inventory_Value_$'] = (df_totals['Oat_Milk_Used']*12.0) + (df_totals['Paper_Cups_Used']*15.0) + (df_totals['Beans_Used']*40.0)
+    df_totals.loc[:, 'Inventory_Value_$'] = (df_totals['Oat_Milk_Used']*12.0) + (df_totals['Paper_Cups_Used']*15.0) + (df_totals['Beans_Used']*40.0)
     inv_val = df_totals['Inventory_Value_$']
     ss_val = (a_milk*12.0 + a_cups*15.0 + a_beans*40.0) * safety_stock_days
     spoilage_writeoff = inv_val.sum() * 0.10 if total_dwell_time > 45 else 0.0
@@ -211,12 +238,12 @@ def main():
     total_ftl_landed_cost = freight_bill + stop_off_fees + ftl_liftgate_fees + detention_fees + layover_fee + total_lumper_fees
 
     # proportional cost allocations per shop
-    df_totals['Allocation_Pct'] = df_totals['Total_Volume_CuFt'] / max(tot_vol, 0.0001)
-    df_totals['Allocated_FTL_Cost_$'] = total_ftl_landed_cost * df_totals['Allocation_Pct']
-    df_totals['Holding_Cost_Penalty_$'] = hc_pen * df_totals['Allocation_Pct']
-    df_totals['Expected_Shortage_Cost_$'] = esc * df_totals['Allocation_Pct']
-    df_totals['Spoilage_Writeoff_$'] = spoilage_writeoff * df_totals['Allocation_Pct']
-    df_totals['True_Net_Savings_$'] = df_totals['Est_LTL_Cost_$'] - (total_ftl_landed_cost * df_totals['Allocation_Pct']) - df_totals['Holding_Cost_Penalty_$'] - df_totals['Expected_Shortage_Cost_$'] - df_totals['Spoilage_Writeoff_$']
+    df_totals.loc[:, 'Allocation_Pct'] = df_totals['Total_Volume_CuFt'] / max(tot_vol, 0.0001)
+    df_totals.loc[:, 'Allocated_FTL_Cost_$'] = total_ftl_landed_cost * df_totals['Allocation_Pct']
+    df_totals.loc[:, 'Holding_Cost_Penalty_$'] = hc_pen * df_totals['Allocation_Pct']
+    df_totals.loc[:, 'Expected_Shortage_Cost_$'] = esc * df_totals['Allocation_Pct']
+    df_totals.loc[:, 'Spoilage_Writeoff_$'] = spoilage_writeoff * df_totals['Allocation_Pct']
+    df_totals.loc[:, 'True_Net_Savings_$'] = df_totals['Est_LTL_Cost_$'] - (total_ftl_landed_cost * df_totals['Allocation_Pct']) - df_totals['Holding_Cost_Penalty_$'] - df_totals['Expected_Shortage_Cost_$'] - df_totals['Spoilage_Writeoff_$']
 
     carbon_credit_value = (((tot_weight/2000.0)*hw_miles*0.12) - ((tot_weight/2000.0)*hw_miles*0.08)) * 0.085
     true_net_savings = df_totals['Est_LTL_Cost_$'].sum() - total_ftl_landed_cost - hc_pen + carbon_credit_value - spoilage_writeoff - esc
@@ -227,26 +254,13 @@ def main():
     is_pipeline_ok = order_cycle_days >= total_lead_time
     is_compliant = is_physical_ok and is_retail_ok and is_pipeline_ok
 
-    # string formatting for ui presentation
-    savings_str = f"-${abs(true_net_savings):,.2f}" if true_net_savings < 0 else f"${true_net_savings:,.2f}"
-    safe_savings_str = savings_str.replace('$', r'\$')
+    safe_savings_str = (f"-${abs(true_net_savings):,.2f}" if true_net_savings < 0 else f"${true_net_savings:,.2f}").replace('$', r'\$')
 
-    # main dashboard layout
+    # Main dashboard UI execution
     st.title("Logistics Control Tower & Routing Optimizer")
     st.markdown("### Executive Logistics Control Tower")
 
-    # header kpi row
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("Optimal FTL Cycle", f"{order_cycle_days} Days", f"Recommended: {max(1, min(opt_cycle, 90))} Days")
-    
-    total_penalty = spoilage_writeoff + esc
-    if total_penalty > 5.0:
-        kpi2.metric("True Net Savings", savings_str, f"-${total_penalty:,.0f} Risk & Spoilage", delta_color="normal")
-    else:
-        kpi2.metric("True Net Savings", savings_str, f"+${carbon_credit_value:,.0f} ESG Tax Credit", delta_color="normal" if true_net_savings > 0 else "inverse")
-        
-    kpi3.metric("Network Survival Risk", f"{service_level:.1f}%", f"Lead Time: {total_lead_time} Days", delta_color="normal" if service_level >= 95 else "inverse")
-    kpi4.metric("Carbon Emissions Avoided", f"{carbon_credit_value / 0.085:,.0f} kg", "EPA Ton-Mile Calc")
+    render_kpi_header(order_cycle_days, opt_cycle, true_net_savings, esc, spoilage_writeoff, carbon_credit_value, service_level, total_lead_time)
 
     st.divider()
 
@@ -283,8 +297,6 @@ def main():
 
     with tab2:
         st.header("2. Physical Capacity & Financial Arbitrage")
-        
-        # physical capacity rendering
         st.markdown("**Trailer Utilization (Tri-Constraint: Cube vs. Weight vs. Pallet Positions):**")
         col_util1, col_util2, col_util3 = st.columns(3)
         with col_util1:
@@ -297,7 +309,6 @@ def main():
             st.metric("Floor Utilized (Pallets)", f"{tot_pallets:,.0f} positions", f"{pallet_fill_rate:.1f}% of {max_pallets} Limit", delta_color="off")
             st.progress(min(pallet_fill_rate / 100.0, 1.0))
 
-        # active alerts
         if not is_pipeline_ok: st.error(f"🛣️ **Pipeline Collision:** Cycle ({order_cycle_days} Days) is shorter than lead time ({total_lead_time} Days).")
         if pallet_fill_rate > 100: st.error(f"**Pallet-Out Alert:** Requires {tot_pallets} pallets. A {trailer_type} holds {max_pallets}.")
         if vol_fill_rate > 100: st.warning(f"**Cube-Out Alert:** Exceeds limits by {tot_vol - max_vol:,.1f} cu ft.")
@@ -311,14 +322,11 @@ def main():
 
         with col_fin1:
             st.markdown("**Cost Arbitrage: Baseline vs. Optimized FTL**")
-            
-            # FIX: By setting the index to precisely match the columns, we stop Streamlit from auto-sorting the X-axis alphabetically
             chart_data = pd.DataFrame({
                 "1. LTL Baseline": [df_totals['Est_LTL_Cost_$'].sum(), 0.0, 0.0],
                 "2. FTL Landed Cost": [0.0, total_ftl_landed_cost, 0.0],
                 "3. Net Savings": [0.0, 0.0, max(0, true_net_savings)]
             }, index=["1. LTL Baseline", "2. FTL Landed Cost", "3. Net Savings"])
-            
             st.bar_chart(chart_data, color=["#dc3545", "#ffc107", "#28a745"])
             
             if tot_weight > 12000 or tot_pallets > 12:
@@ -332,32 +340,25 @@ def main():
             })
             st.dataframe(invoice_df, hide_index=True, use_container_width=True)
             
-            if not is_compliant:
-                st.error(f"**Dispatch Blocked:** Theoretical savings of {safe_savings_str} voided due to physical/retail violations.")
-            elif true_net_savings > 0: 
-                st.success(f"**Profitable Dispatch:** Shipment cleared. Net ROI is {safe_savings_str} after USD {hc_pen:,.2f} in WACC & Storage hold costs.")
-            else: 
-                st.error(f"**Reject Bid:** Generating a net loss of {safe_savings_str}. Carrier rates or holding costs are too high.")
+            if not is_compliant: st.error(f"**Dispatch Blocked:** Theoretical savings of {safe_savings_str} voided due to physical/retail violations.")
+            elif true_net_savings > 0: st.success(f"**Profitable Dispatch:** Shipment cleared. Net ROI is {safe_savings_str} after USD {hc_pen:,.2f} in WACC & Storage hold costs.")
+            else: st.error(f"**Reject Bid:** Generating a net loss of {safe_savings_str}. Carrier rates or holding costs are too high.")
 
         st.divider()
 
-        # regulatory checks
         st.subheader("Automated Regulatory Clearance")
         col_reg1, col_reg2, col_reg3, col_reg4 = st.columns(4)
         with col_reg1:
             if weight_fill_rate <= 100: st.success("⚖️ DOT Weigh Station\n\n**CLEARED**")
             else: st.error("⚖️ DOT Weigh Station\n\n**FAILED**")
-        with col_reg2:
-            st.success("🔬 FSMA Sanitary Transport\n\n**MANIFESTED**")
-        with col_reg3:
-            st.success("🌿 CARB Emissions\n\n**COMPLIANT**")
+        with col_reg2: st.success("🔬 FSMA Sanitary Transport\n\n**MANIFESTED**")
+        with col_reg3: st.success("🌿 CARB Emissions\n\n**COMPLIANT**")
         with col_reg4:
             if layover_fee == 0: st.success("⏱️ FMCSA HOS Clock\n\n**VERIFIED**")
             else: st.warning("⏱️ FMCSA HOS Clock\n\n**LAYOVER REQUIRED**")
 
         st.divider()
         
-        # participant data table
         st.markdown("**Individual Participant Savings Breakdown (Total Landed Cost):**")
         
         display_cols = ['Shop_Location', 'Total_Pallets', 'Total_Weight_Lbs', 'Inventory_Value_$', 'Holding_Cost_Penalty_$']
@@ -365,23 +366,19 @@ def main():
         if esc > 0: display_cols.append('Expected_Shortage_Cost_$')
         display_cols.append('True_Net_Savings_$')
         
-        df_display = df_totals[display_cols].copy()
+        # Senior Dev Enforced: .loc required for safe extraction and assignment
+        df_display = df_totals.loc[:, display_cols].copy()
         round_cols = ['Inventory_Value_$', 'Holding_Cost_Penalty_$', 'True_Net_Savings_$']
         if spoilage_writeoff > 0: round_cols.append('Spoilage_Writeoff_$')
         if esc > 0: round_cols.append('Expected_Shortage_Cost_$')
-        for col in round_cols: df_display[col] = df_display[col].round(2)
+        
+        for col in round_cols: 
+            df_display.loc[:, col] = df_display[col].round(2)
 
-        rename_dict = {
-            'Shop_Location': 'Shop',
-            'Total_Pallets': 'Pallets',
-            'Total_Weight_Lbs': 'Weight (lbs)',
-            'Inventory_Value_$': 'Inv Value ($)',
-            'Holding_Cost_Penalty_$': 'Hold Cost ($)',
-            'Expected_Shortage_Cost_$': 'Risk Pen ($)',
-            'Spoilage_Writeoff_$': 'Spoilage ($)',
-            'True_Net_Savings_$': 'Net Savings ($)'
-        }
-        df_display = df_display.rename(columns=rename_dict)
+        df_display = df_display.rename(columns={
+            'Shop_Location': 'Shop', 'Total_Pallets': 'Pallets', 'Total_Weight_Lbs': 'Weight (lbs)', 'Inventory_Value_$': 'Inv Value ($)',
+            'Holding_Cost_Penalty_$': 'Hold Cost ($)', 'Expected_Shortage_Cost_$': 'Risk Pen ($)', 'Spoilage_Writeoff_$': 'Spoilage ($)', 'True_Net_Savings_$': 'Net Savings ($)'
+        })
 
         col_tbl, col_chart = st.columns([1.5, 1])
         with col_tbl:
