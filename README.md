@@ -8,6 +8,7 @@ This application is a Python-based Logistics Control Tower designed to optimize 
 The engine incorporates financial arbitrage calculations, Monte Carlo risk simulations, and automated compliance checks to ensure all generated routes are legally and physically viable before generating a manifest.
 
 ## Core Features
+* **Decoupled Architecture:** Configuration parameters (origin hubs, trailer specifications) are isolated in a lightweight `database.json` file, allowing for seamless network scaling without altering core Python logic.
 * **Capacity Engine:** Evaluates payloads against trailer cube (cu ft), DOT weight limits (lbs), and floor pallet positions, including double-stacking constraints.
 * **Stochastic Risk Modeling:** Runs 1,000-iteration Monte Carlo simulations against dynamic transit times to calculate network survival probability and Expected Shortage Cost (ESC).
 * **Demand Forecasting:** Uses ARIMA time-series modeling to project 7-day inventory depletion across the retail network.
@@ -15,10 +16,11 @@ The engine incorporates financial arbitrage calculations, Monte Carlo risk simul
 * **Financial Arbitrage:** Calculates total landed cost by comparing LTL base rates against FTL linehauls, dynamically applying accessorials (detention, liftgate, lumper fees) and holding cost penalties (WACC, inventory spoilage).
 * **TMS Integration:** Exports machine-readable JSON payload manifests for direct tender into external Transportation Management Systems.
 
-## Tech Stack
-* **Frontend:** Streamlit
-* **Data & Math:** Pandas, NumPy, Statsmodels (ARIMA)
+## Tech Stack & Engineering
+* **Frontend:** Streamlit (Modular UI Architecture)
+* **Data & Math:** Pandas (Strict `.loc` memory-safe execution), NumPy, Statsmodels (ARIMA)
 * **Routing API:** OSRM (Open Source Routing Machine)
+* **Data Storage:** JSON (Configuration), CSV (Historical Demand)
 
 ## Local Setup
 1. Clone the repository.
